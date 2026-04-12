@@ -6,7 +6,7 @@ from datetime import date
 # ===== הגדרות — נקראות מ-Environment Variables של Railway =====
 LOGIN_URL   = "https://cellular.neworder.co.il/heb/direct.aspx?UserName=nChDORjeuASklAO4HRJVcQ==&StoreName=eL/mCT/S9JtKfrclQgpe2Q==&password=y5leGHLlRcO1YFjej3CeHQ=="
 REPORT_URL  = "https://cellular.neworder.co.il/heb/reports/reportgenerator.aspx"
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # כתובת ה-Worker
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://debt-worker.bnaya-av.workers.dev")   # כתובת ה-Worker
 NAV_CTRL    = "ctl00$ctrlNavigationBar$ctl286"     # val=385 ריכוז קניות הקפה
 UA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
@@ -118,13 +118,13 @@ def run():
     # ── 2. דף הדוחות ────────────────────────────────────────
     print("\n[2] טוען דף דוחות...")
     r2    = session.get(REPORT_URL, headers={"User-Agent": UA}, timeout=20)
-    soup2 = BeautifulSoup(r2.text, "html.parser")
+    soup2 = BeautifulSoup(r2.text, "lxml")
     print(f"    ✅ {len(r2.text):,} תווים")
 
     # ── 3. בחירת דוח הקפה ───────────────────────────────────
     print("\n[3] בוחר דוח 'ריכוז קניות הקפה'...")
     r3    = http_post(session, soup2, {"__EVENTTARGET": NAV_CTRL, "__EVENTARGUMENT": ""})
-    soup3 = BeautifulSoup(r3.text, "html.parser")
+    soup3 = BeautifulSoup(r3.text, "lxml")
     print(f"    ✅ {r3.status_code} | {len(r3.text):,} תווים")
 
     # ── 4. שדות תאריך ───────────────────────────────────────
@@ -141,12 +141,14 @@ def run():
     if btn_field:
         extra[btn_field] = "הצג דו''ח"
     r4    = http_post(session, soup3, extra)
-    soup4 = BeautifulSoup(r4.text, "html.parser")
+    soup4 = BeautifulSoup(r4.text, "lxml")
     print(f"    ✅ {r4.status_code} | {len(r4.text):,} תווים")
 
     # ── 6. חילוץ נתונים ─────────────────────────────────────
     print("\n[6] מחלץ נתונים...")
+    print(f"    גודל HTML: {len(r4.text):,} תווים")
     rows = extract_rows(soup4)
+    del soup4  # שחרר זיכרון מיד אחרי חילוץ
 
     if not rows:
         print("    ℹ️  אין עסקאות הקפה להיום — לא נשלח דבר")
