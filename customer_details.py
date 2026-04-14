@@ -102,11 +102,15 @@ def fetch_customer_detail(session, html_after_select, code, name):
     return parse_customer_transactions(r.text, code)
 
 # ── פרסור טבלה ───────────────────────────────────────────────
-def parse_customer_transactions(html, code):
+def parse_customer_transactions(html, code, session=None):
     soup = BeautifulSoup(html, "lxml")
     table = soup.find("table", {"id": "MainContent_gvReportData"})
     if not table:
         return []
+    
+    # חשב תאריך 12 חודשים אחרונים
+    from datetime import datetime, timedelta
+    cutoff = datetime.now() - timedelta(days=365)
     
     transactions = []
     rows = table.find_all("tr")
@@ -116,35 +120,63 @@ def parse_customer_transactions(html, code):
         if len(cells) < 8:
             continue
         
-        # שורה ראשית
         try:
-            doc_type  = cells[1].get_text(strip=True)  # סוג מסמך
-            date      = cells[4].get_text(strip=True)  # תאריך
-            amount    = cells[7].get_text(strip=True)  # סכום
+            doc_type  = cells[1].get_text(strip=True)
+            date_str  = cells[4].get_text(strip=True)  # DD-MM-YYYY
+            amount    = cells[7].get_text(strip=True)
             balance   = cells[8].get_text(strip=True) if len(cells) > 8 else ""
             
-            # בדוק אם יש פירוט פנימי
-            nested_table = soup.find("table", {"id": f"MainContent_gvReportData_gvNested_{i}"})
-            items = []
-            if nested_table:
-                for nrow in nested_table.find_all("tr")[1:]:  # דלג header
-                    ncells = nrow.find_all("td")
-                    if len(ncells) >= 4:
-                        items.append({
-                            "code":     ncells[0].get_text(strip=True),
-                            "desc":     ncells[1].get_text(strip=True),
-                            "qty":      ncells[2].get_text(strip=True),
-                            "price":    ncells[3].get_text(strip=True),
-                        })
+            if not doc_type or not date_str:
+                continue
             
-            if doc_type and date:
-                transactions.append({
-                    "type":    doc_type,
-                    "date":    date,
-                    "amount":  amount,
-                    "balance": balance,
-                    "items":   items,
-                })
+            # בדוק אם תנועה חדשה מספיק לפרסור items
+            items = []
+            try:
+                dt = datetime.strptime(date_str, "%d-%m-%Y")
+                is_recent = dt >= cutoff
+            except:
+                is_recent = False
+            
+            # שלוף items רק לתנועות חדשות עם כפתור +
+            if is_recent and session:
+                btn = row.find("input", {"type": "image"}) or row.find("img", {"src": lambda s: s and "plus" in s.lower()})
+                # חפש כפתור postback
+                ctrl_match = None
+                for inp in row.find_all("input"):
+                    nm = inp.get("name", "")
+                    if "imgShowNestedGrid" in nm:
+                        ctrl_match = nm
+                        break
+                
+                if ctrl_match:
+                    try:
+                        vs = get_viewstate(session)
+                        vs["__EVENTTARGET"] = ctrl_match
+                        vs["__EVENTARGUMENT"] = ""
+                        r2 = session.post(REPORT_URL, data=vs, timeout=30)
+                        soup2 = BeautifulSoup(r2.text, "lxml")
+                        nested = soup2.find("table", {"id": f"MainContent_gvReportData_gvNested_{i}"})
+                        if nested:
+                            for nrow in nested.find_all("tr")[1:]:
+                                ncells = nrow.find_all("td")
+                                if len(ncells) >= 4:
+                                    items.append({
+                                        "code":  ncells[0].get_text(strip=True),
+                                        "desc":  ncells[1].get_text(strip=True),
+                                        "qty":   ncells[2].get_text(strip=True),
+                                        "price": ncells[3].get_text(strip=True),
+                                    })
+                        time.sleep(0.3)
+                    except Exception as e:
+                        pass
+            
+            transactions.append({
+                "type":    doc_type,
+                "date":    date_str,
+                "amount":  amount,
+                "balance": balance,
+                "items":   items,
+            })
         except Exception:
             continue
     
