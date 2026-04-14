@@ -152,6 +152,7 @@ def parse_transactions(html, session=None):
             items = []
             try:
                 dt = datetime.strptime(date_str, "%d-%m-%Y")
+                print(f"      row {idx}: date={date_str} dt={dt.date()} cutoff={cutoff.date()} recent={dt>=cutoff}")
                 if dt >= cutoff and session:
                     items = click_plus(session, html, idx)
                     if items:
