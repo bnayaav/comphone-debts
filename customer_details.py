@@ -141,10 +141,11 @@ def parse_transactions(html, session=None):
         if len(cells) < 8:
             continue
         try:
-            doc_type = cells[1].get_text(strip=True)
-            date_str = cells[4].get_text(strip=True)
-            amount   = cells[7].get_text(strip=True)
-            balance  = cells[8].get_text(strip=True) if len(cells) > 8 else ""
+            invoice  = cells[1].get_text(strip=True)   # מספר חשבונית
+            doc_type = cells[2].get_text(strip=True)   # תאור מסמך
+            date_str = cells[4].get_text(strip=True)   # תאריך
+            amount   = cells[8].get_text(strip=True)   # סכום
+            balance  = cells[9].get_text(strip=True) if len(cells) > 9 else ""  # יתרה
             if not doc_type or not date_str:
                 continue
 
@@ -160,6 +161,7 @@ def parse_transactions(html, session=None):
                 print(f"        ⚠️ items error: {e}")
 
             transactions.append({
+                "invoice": invoice,
                 "type":    doc_type,
                 "date":    date_str,
                 "amount":  amount,
