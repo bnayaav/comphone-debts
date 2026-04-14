@@ -187,3 +187,11 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+
+# הפעל פירוט לקוחות
+try:
+    import customer_details
+    customer_details.main()
+except Exception as e:
+    print(f'⚠️  פירוט לקוחות נכשל: {e}')
