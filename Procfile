@@ -1,1 +1,1 @@
-worker: python hekfe_daily.py
+worker: python run_all.py
