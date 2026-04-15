@@ -70,6 +70,7 @@ def fetch_customer(session, html_base, code, name):
 
 def click_plus(session, html, row_idx):
     """לחץ על כפתור + בשורה מסוימת ושלוף items"""
+    print(f"      → click_plus({row_idx})")
     soup = BeautifulSoup(html, "lxml")
     vs   = get_vs(session, html)
 
@@ -159,7 +160,9 @@ def parse_transactions(html, session=None):
                         print(f"        ✅ {len(items)} פריטים")
                     time.sleep(0.5)
             except Exception as e:
-                print(f"        ⚠️ items error: {e}")
+                import traceback
+                print(f"        ❌ items error: {e}")
+                traceback.print_exc()
 
             transactions.append({
                 "invoice": invoice,
