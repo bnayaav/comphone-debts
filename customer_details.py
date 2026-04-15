@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 """
 שליפת פירוט קניות הקפה לכל לקוח עם חוב
-כולל לחיצה על + לכל שורה לשליפת פריטים
+כולל לחיצת + לפירוט פריטים
 """
-import os, re, time, requests
-from datetime import datetime, timedelta
+import os, requests, time, logging
 from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
 
-LOGIN_URL           = "https://cellular.neworder.co.il/heb/direct.aspx?UserName=nChDORjeuASklAO4HRJVcQ==&StoreName=eL/mCT/S9JtKfrclQgpe2Q==&password=y5leGHLlRcO1YFjej3CeHQ=="
-WORKER_URL          = os.environ.get("WEBHOOK_URL", "https://debt-worker.bnaya-av.workers.dev").rstrip("/")
-REPORT_URL          = "https://cellular.neworder.co.il/heb/reports/reportgenerator.aspx"
-CUSTOMER_REPORT_NAV = os.environ.get("CUSTOMER_REPORT_NAV", "ctl00$ctrlNavigationBar$ctl274")
-UA                  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-DAYS_BACK           = 365  # שלוף פריטים רק לתנועות מ-12 חודשים אחרונים
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+log = logging.getLogger(__name__)
+
+LOGIN_URL   = "https://cellular.neworder.co.il/heb/direct.aspx?UserName=nChDORjeuASklAO4HRJVcQ==&StoreName=eL/mCT/S9JtKfrclQgpe2Q==&password=y5leGHLlRcO1YFjej3CeHQ=="
+REPORT_URL  = "https://cellular.neworder.co.il/heb/reports/reportgenerator.aspx"
+WORKER_URL  = os.environ.get("WEBHOOK_URL", "https://debt-worker.bnaya-av.workers.dev").rstrip("/")
+NAV_CTRL    = os.environ.get("CUSTOMER_REPORT_NAV", "ctl00$ctrlNavigationBar$ctl274")
 
 def login():
-    session = requests.Session()
-    session.headers.update({"User-Agent": UA})
-    print("[1] מתחבר...")
-    r = session.get(LOGIN_URL, timeout=30)
-    print(f"    ✅ {r.url.split('/')[-1].split('?')[0]}")
-    return session
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    r = s.get(LOGIN_URL, timeout=30)
+    log.info(f"התחברות: {r.status_code}")
+    return s
 
-def get_vs(session, html=None):
-    if html is None:
-        r = session.get(REPORT_URL, timeout=30)
-        html = r.text
-    soup = BeautifulSoup(html, "lxml")
-    def v(n): f = soup.find("input", {"name": n}); return f["value"] if f else ""
+def get_vs(soup):
+    def v(n):
+        el = soup.find("input", {"name": n})
+        return el["value"] if el else ""
     return {
         "__VIEWSTATE":          v("__VIEWSTATE"),
         "__VIEWSTATEGENERATOR": v("__VIEWSTATEGENERATOR") or "3B3F7A04",
@@ -36,145 +34,125 @@ def get_vs(session, html=None):
         "__EVENTARGUMENT":      "",
     }
 
-def select_report(session):
-    vs = get_vs(session)
-    vs["__EVENTTARGET"] = CUSTOMER_REPORT_NAV
-    r = session.post(REPORT_URL, data=vs, timeout=30)
-    print(f"    ✅ דוח נבחר ({len(r.text):,} תווים)")
-    return r.text
+def get_hidden_keys(soup):
+    """שדות hdnPrimaryGridKeyValue — נדרשים לבקשות postback"""
+    keys = {}
+    for inp in soup.find_all("input", {"name": lambda n: n and "hdnPrimaryGridKeyValue" in n}):
+        keys[inp["name"]] = inp.get("value", "")
+    return keys
 
-def fetch_customer(session, html_base, code, name):
-    vs = get_vs(session, html_base)
-    soup_base = BeautifulSoup(html_base, "lxml")
-
-    payload = {
-        **vs,
-        "__EVENTTARGET": "",
-        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnReportFieldID": "200",
-        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnIsInputControlParameter": "False",
-        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnReportFieldTypeID": "7",
-        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$txtAutoCompleteField": name,
-        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnAutoCompleteSelectedValue": str(code),
-        "ctl00$MainContent$btnConfirm": "הצג דו''ח",
-    }
-    # הגבל לשנה אחרונה
-    date_from = (datetime.now() - timedelta(days=DAYS_BACK)).strftime("%d/%m/%Y")
-    date_to   = datetime.now().strftime("%d/%m/%Y")
-    for inp in soup_base.find_all("input"):
-        nm = inp.get("name", "")
-        if "txtFromDate" in nm: payload[nm] = date_from
-        if "txtToDate"   in nm: payload[nm] = date_to
-
-    r = session.post(REPORT_URL, data=payload, timeout=60)
-    return parse_transactions(r.text, session)
-
-def click_plus(session, html, row_idx):
-    """לחץ על כפתור + בשורה מסוימת ושלוף items"""
-    print(f"      → click_plus({row_idx})")
-    soup = BeautifulSoup(html, "lxml")
-    vs   = get_vs(session, html)
-
-    # DEBUG: הדפס את שמות ה-inputs בשורה
+def parse_rows(soup):
     table = soup.find("table", {"id": "MainContent_gvReportData"})
     if not table:
         return []
-    rows = [r for r in table.find_all("tr") if r.find_all("td")]
-    if row_idx >= len(rows):
+    rows = []
+    for tr in table.find_all("tr")[1:]:
+        cells = tr.find_all("td")
+        if len(cells) < 9:
+            continue
+        plus = tr.find("input", {"type": "image"})
+        plus_name = plus["name"] if plus else None
+        rows.append({
+            "plusBtnName": plus_name,
+            "invoice":     cells[1].get_text(strip=True),
+            "docType":     cells[2].get_text(strip=True),
+            "date":        cells[4].get_text(strip=True),
+            "amount":      cells[8].get_text(strip=True) if len(cells) > 8 else "",
+            "balance":     cells[9].get_text(strip=True) if len(cells) > 9 else "",
+            "items":       [],
+        })
+    return rows
+
+def parse_nested(soup):
+    tables = soup.find_all("table", id=lambda x: x and "gvNested" in x)
+    if not tables:
         return []
-    row = rows[row_idx]
-    inputs = row.find_all("input")
-    names  = [inp.get("name","") for inp in inputs]
-    print(f"      DEBUG row {row_idx} inputs: {names}")
-
-    # חפש input של כפתור +
-    ctrl = None
-    for nm in names:
-        if "imgShowNestedGrid" in nm or "ShowNested" in nm or "btnPlus" in nm:
-            ctrl = nm
-            break
-    # ניסיון נוסף — input type=image
-    if not ctrl:
-        for inp in inputs:
-            if inp.get("type","").lower() == "image":
-                ctrl = inp.get("name","")
-                break
-
-    if not ctrl:
-        return []
-
-    print(f"      → לוחץ {ctrl}")
-    vs["__EVENTTARGET"]   = ctrl
-    vs["__EVENTARGUMENT"] = ""
-    r2 = session.post(REPORT_URL, data=vs, timeout=30)
-    soup2 = BeautifulSoup(r2.text, "lxml")
-
-    # חפש טבלת nested
-    nested = soup2.find("table", {"id": re.compile(r"gvNested")})
-    if not nested:
-        nested = soup2.find("table", {"id": f"MainContent_gvReportData_gvNested_{row_idx}"})
-    if not nested:
-        return []
-
+    table = tables[-1]
     items = []
-    for nrow in nested.find_all("tr")[1:]:
-        ncells = nrow.find_all("td")
-        if len(ncells) >= 4:
+    for tr in table.find_all("tr")[1:]:
+        cells = tr.find_all("td")
+        if len(cells) >= 4:
             items.append({
-                "code":  ncells[0].get_text(strip=True),
-                "desc":  ncells[1].get_text(strip=True),
-                "qty":   ncells[2].get_text(strip=True),
-                "price": ncells[3].get_text(strip=True),
+                "code":  cells[0].get_text(strip=True),
+                "desc":  cells[1].get_text(strip=True),
+                "qty":   cells[2].get_text(strip=True),
+                "price": cells[3].get_text(strip=True),
             })
     return items
 
-def parse_transactions(html, session=None):
-    soup  = BeautifulSoup(html, "lxml")
-    table = soup.find("table", {"id": "MainContent_gvReportData"})
-    if not table:
-        return []
+def is_recent(date_str):
+    try:
+        dt = datetime.strptime(date_str, "%d-%m-%Y")
+        return dt >= datetime.now() - timedelta(days=365)
+    except:
+        return False
 
-    cutoff = datetime.now() - timedelta(days=DAYS_BACK)
-    transactions = []
-    data_rows = [r for r in table.find_all("tr") if r.find_all("td")]
+def get_customer_txns(session, code, name):
+    # 1. טעינת דף
+    r = session.get(REPORT_URL, timeout=30)
+    soup = BeautifulSoup(r.text, "lxml")
+    vs = get_vs(soup)
 
-    for idx, row in enumerate(data_rows):
-        cells = row.find_all("td")
-        if len(cells) < 8:
+    # 2. ניווט לדוח תנועות הקפה ללקוח
+    vs["__EVENTTARGET"] = NAV_CTRL
+    r = session.post(REPORT_URL, data=vs, timeout=30)
+    soup = BeautifulSoup(r.text, "lxml")
+    vs = get_vs(soup)
+
+    # 3. שלח דוח ללקוח
+    payload = {
+        **vs,
+        "__EVENTTARGET": "",
+        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnReportFieldID":              "200",
+        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnIsInputControlParameter":    "False",
+        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnReportFieldTypeID":          "7",
+        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$txtAutoCompleteField":          name,
+        "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnAutoCompleteSelectedValue":  str(code),
+        "ctl00$MainContent$btnConfirm": "הצג דו''ח",
+    }
+    r = session.post(REPORT_URL, data=payload, timeout=60)
+    soup = BeautifulSoup(r.text, "lxml")
+    vs = get_vs(soup)
+
+    # 4. פרסר שורות
+    all_rows = parse_rows(soup)
+    recent_rows = [row for row in all_rows if is_recent(row["date"])]
+    log.info(f"    {len(recent_rows)} תנועות חדשות (מתוך {len(all_rows)})")
+
+    # 5. לכל תנועה חדשה — לחץ + לפירוט פריטים
+    for idx, row in enumerate(recent_rows):
+        if not row["plusBtnName"]:
             continue
-        try:
-            invoice  = cells[1].get_text(strip=True)   # מספר חשבונית
-            doc_type = cells[2].get_text(strip=True)   # תאור מסמך
-            date_str = cells[4].get_text(strip=True)   # תאריך
-            amount   = cells[8].get_text(strip=True)   # סכום
-            balance  = cells[9].get_text(strip=True) if len(cells) > 9 else ""  # יתרה
-            if not doc_type or not date_str:
-                continue
 
-            items = []
-            try:
-                dt = datetime.strptime(date_str, "%d-%m-%Y")
-                print(f"      row {idx}: date={date_str} dt={dt.date()} cutoff={cutoff.date()} recent={dt>=cutoff}")
-                if dt >= cutoff and session:
-                    items = click_plus(session, html, idx)
-                    if items:
-                        print(f"        ✅ {len(items)} פריטים")
-                    time.sleep(0.5)
-            except Exception as e:
-                import traceback
-                print(f"        ❌ items error: {e}")
-                traceback.print_exc()
+        log.info(f"    [{idx+1}/{len(recent_rows)}] לוחץ + תנועה {row['invoice']} | {row['date']}")
 
-            transactions.append({
-                "invoice": invoice,
-                "type":    doc_type,
-                "date":    date_str,
-                "amount":  amount,
-                "balance": balance,
-                "items":   items,
-            })
-        except Exception:
-            continue
-    return transactions
+        hidden = get_hidden_keys(soup)
+        payload_plus = {
+            **vs,
+            "__EVENTTARGET":  "",
+            "__EVENTARGUMENT": "",
+            row["plusBtnName"] + ".x": "1",
+            row["plusBtnName"] + ".y": "1",
+            "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnReportFieldID":              "200",
+            "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnIsInputControlParameter":    "False",
+            "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnReportFieldTypeID":          "7",
+            "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$txtAutoCompleteField":          name,
+            "ctl00$MainContent$rptWhereFieldsParameters$ctl00$ctrlReportField$hdnAutoCompleteSelectedValue":  str(code),
+            **hidden,
+        }
+
+        r2 = session.post(REPORT_URL, data=payload_plus, timeout=30)
+        soup2 = BeautifulSoup(r2.text, "lxml")
+        items = parse_nested(soup2)
+        row["items"] = items
+        log.info(f"      {len(items)} פריטים")
+
+        # עדכן soup ו-vs לבקשה הבאה
+        soup = soup2
+        vs = get_vs(soup2)
+        time.sleep(0.4)
+
+    return recent_rows
 
 def push_to_worker(code, transactions):
     try:
@@ -185,7 +163,7 @@ def push_to_worker(code, transactions):
         )
         return res.ok
     except Exception as e:
-        print(f"    ⚠️ Worker: {e}")
+        log.error(f"Worker: {e}")
         return False
 
 def get_debtors():
@@ -195,36 +173,32 @@ def get_debtors():
         return [(c["code"], c["name"], c["balance"])
                 for c in custs.values() if c.get("balance", 0) > 0]
     except Exception as e:
-        print(f"⚠️ {e}")
+        log.error(e)
         return []
 
 def main():
-    print("=" * 50)
-    print("  פירוט קניות הקפה לכל לקוח")
-    print("=" * 50)
+    log.info("=" * 50)
+    log.info("  פירוט קניות הקפה לכל לקוח")
+    log.info("=" * 50)
 
     session = login()
-
-    print("\n[2] בוחר דוח לקוח...")
-    html_report = select_report(session)
-
     debtors = get_debtors()
-    print(f"\n[3] מעבד {len(debtors)} לקוחות...")
+    log.info(f"מעבד {len(debtors)} לקוחות...")
 
     for i, (code, name, balance) in enumerate(debtors[:50]):
-        print(f"  [{i+1}/50] {name} ({code}) — ₪{balance}")
+        log.info(f"[{i+1}/50] {name} ({code}) ₪{balance}")
         try:
-            txns = fetch_customer(session, html_report, code, name)
+            txns = get_customer_txns(session, code, name)
             if txns:
                 push_to_worker(code, txns)
-                print(f"    ✅ {len(txns)} תנועות → Worker")
+                log.info(f"  ✅ {len(txns)} תנועות → Worker")
             else:
-                print("    ⚪ אין תנועות")
+                log.info("  ⚪ אין תנועות")
             time.sleep(1)
         except Exception as e:
-            print(f"    ❌ {e}")
+            log.error(f"  ❌ {e}")
 
-    print("\n✅ הסתיים")
+    log.info("✅ הסתיים")
 
 if __name__ == "__main__":
     main()
